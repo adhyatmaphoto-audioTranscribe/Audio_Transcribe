@@ -27,4 +27,4 @@ jobs:
     - name: Execute Transcriber Pipeline
       env:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      run: python split_pdf_cloud_script.py
+      run: Audio_Transcribe
