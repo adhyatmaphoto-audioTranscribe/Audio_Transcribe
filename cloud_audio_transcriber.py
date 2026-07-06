@@ -1,30 +1,32 @@
 import os
 import re
 import time
+import json
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from googleapiclient.discovery import build
+from google.oauth2 import service_account  # Requires: pip install google-auth
 import requests
 from mutagen.mp3 import MP3  # Requires: pip install mutagen
 
-# Load your Gemini API Key safely from your local .env file
+# Load variables safely from your local .env file
 load_dotenv()
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MODEL_ID = 'gemini-3.5-flash' 
+MODEL_ID = 'gemini-2.5-flash' 
 MAX_RETRIES = 2  
 
-# UPDATED: Google Drive Public Folder ID extracted from your link
+# Google Drive Public Folder ID
 FOLDER_ID = '17MGWbLC8Qq_UxLCtOePc9aJgVSAakhde'         
 
 # CLEAN DIRECTORY SEPARATION
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-AUDIO_FOLDER = os.path.join(SCRIPT_DIR, 'temp_audio')       # <-- Add this folder to your .gitignore
-TRANSCRIPT_FOLDER = os.path.join(SCRIPT_DIR, 'transcripts') # <-- DO NOT ignore this folder (Saves TXT files to GitHub)
+AUDIO_FOLDER = os.path.join(SCRIPT_DIR, 'temp_audio')       
+TRANSCRIPT_FOLDER = os.path.join(SCRIPT_DIR, 'transcripts') 
 SUPPORTED_FORMATS = ('.mp3', '.wav', '.m4a', '.aac', '.flac')
 
 SYSTEM_PROMPT = (
@@ -44,12 +46,17 @@ SYSTEM_PROMPT = (
 )
 
 def get_public_drive_service():
-    """Builds a public Drive reader using ONLY your API Key."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    return build('drive', 'v3', developerKey=api_key)
+    """Builds a Drive reader using a Service Account string from environment memory."""
+    sa_json_str = os.environ.get("GDRIVE_SERVICE_ACCOUNT")
+    if not sa_json_str:
+        raise ValueError("❌ Missing GDRIVE_SERVICE_ACCOUNT in environment variables!")
+    
+    # Parse the raw text string into a JSON dictionary directly in memory
+    sa_info = json.loads(sa_json_str)
+    credentials = service_account.Credentials.from_service_account_info(sa_info)
+    return build('drive', 'v3', credentials=credentials)
 
 def get_mp3_duration(file_path):
-    """Reads the true duration of the MP3 file directly from disk like Windows File Manager."""
     try:
         audio = MP3(file_path)
         mins = audio.info.length / 60
@@ -66,7 +73,7 @@ def main():
     os.makedirs(AUDIO_FOLDER, exist_ok=True)
     os.makedirs(TRANSCRIPT_FOLDER, exist_ok=True)
 
-    # 1. SCAN PUBLIC FOLDER USING API KEY
+    # 1. SCAN PUBLIC FOLDER USING SERVICE ACCOUNT AS IDENTITY
     print("\n📥 Scanning public Google Drive folder...")
     try:
         drive_service = get_public_drive_service()
@@ -121,6 +128,7 @@ def main():
 
         print(f"\n📥 [{i}/{len(pending_audio)}] Downloading via Public Stream: {filename}...")
         try:
+            # Clean direct download URL for public files
             download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
             response = requests.get(download_url, stream=True)
             with open(file_path, 'wb') as f:
@@ -142,7 +150,7 @@ def main():
         while not success:
             try:
                 if not audio_upload:
-                    print(f"⏳ Uploading 30MB file to Gemini File storage API...")
+                    print(f"⏳ Uploading file to Gemini File storage API...")
                     audio_upload = client.files.upload(file=file_path)
                     
                 file_info = client.files.get(name=audio_upload.name)
