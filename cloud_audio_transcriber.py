@@ -17,7 +17,7 @@ load_dotenv()
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MODEL_ID = 'gemini-2.5-flash' 
+MODEL_ID = 'gemini-3.5-flash' 
 MAX_RETRIES = 2  
 
 # Google Drive Public Folder ID
