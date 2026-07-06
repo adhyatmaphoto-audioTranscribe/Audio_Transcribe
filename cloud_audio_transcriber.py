@@ -1,23 +1,30 @@
 import os
-import io
+import re
 import time
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
-
-# Google Cloud Drive API Modules
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+import requests
+from mutagen.mp3 import MP3  # Requires: pip install mutagen
 
-# =============================================================================
-# SECURE CONFIGURATION CONTROL PANEL
-# =============================================================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
-DRIVE_TOKEN_FILE = 'token.json'
+# Load your Gemini API Key safely from your local .env file
+load_dotenv()
 
-MODEL_ID = 'gemini-3.5-flash'
+# ==========================================
+# CONFIGURATION
+# ==========================================
+MODEL_ID = 'gemini-3.5-flash' 
 MAX_RETRIES = 2  
+
+# UPDATED: Google Drive Public Folder ID extracted from your link
+FOLDER_ID = '17MGWbLC8Qq_UxLCtOePc9aJgVSAakhde'         
+
+# CLEAN DIRECTORY SEPARATION
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+AUDIO_FOLDER = os.path.join(SCRIPT_DIR, 'temp_audio')       # <-- Add this folder to your .gitignore
+TRANSCRIPT_FOLDER = os.path.join(SCRIPT_DIR, 'transcripts') # <-- DO NOT ignore this folder (Saves TXT files to GitHub)
 SUPPORTED_FORMATS = ('.mp3', '.wav', '.m4a', '.aac', '.flac')
 
 SYSTEM_PROMPT = (
@@ -27,245 +34,192 @@ SYSTEM_PROMPT = (
     "Strict Rules:\n"
     "1. Multi-Lingual & Multi-Script Handling:\n"
     "   - The primary audio is English spoken with an Indian (Odisha region) accent.\n"
-    "   - For Sanskrit and Hindi phrases: Transcribe them strictly in the Devanagari script.\n"
-    "   - For Odia (Oriya) and Bengali phrases: If you are 100% certain of the language, transcribe them in their respective native scripts (Odia/Bengali script). If you are uncertain, default to transcribing those Odia and Bengali phrases in Devanagari script.\n"
-    "   - Do NOT translate any non-English phrases into English. Transcribe the spoken sounds into the designated script.\n"
-    "2. Poor Quality Audio: If a word is muffled, distorted, or cut off, do not guess what the speaker meant to say. Write exactly the broken phonetic sound heard, or use [unclear] if it is entirely unintelligible.\n"
-    "3. No Autocorrect: Do not correct grammar, do not change broken sentence structures, and do not replace slang or colloquialisms.\n"
-    "4. Literalism: If the speaker repeats a word, stutters, or makes a verbal slip, transcribe it exactly. Do not edit it out.\n"
-    "5. Formatting Constraints:\n"
-    "   - Do not add conversational introductions, explanations, summaries, or metadata notes.\n"
-    "   - Output ONLY the raw transcript text."
+    "   - For Sanskrit and Hindi phrases: Transcribe them strictly in Devanagari script.\n"
+    "   - For Odia (Oriya) and Bengali phrases: If you are 100% certain of the language, transcribe them in their respective native scripts. Default to Devanagari if uncertain.\n"
+    "   - Do NOT translate any non-English phrases into English.\n"
+    "2. Poor Quality Audio: Write exactly the broken phonetic sound heard, or use [unclear].\n"
+    "3. No Autocorrect: Do not correct grammar or broken sentence structures.\n"
+    "4. Literalism: Transcribe stutters or repetitions exactly.\n"
+    "5. Formatting Constraints: Output ONLY the raw transcript text."
 )
 
-# =============================================================================
-# API CORE INITIALIZERS
-# =============================================================================
-def get_drive_service():
-    """Authenticates with the Google Drive API via Personal User OAuth Token."""
-    if not os.path.exists(DRIVE_TOKEN_FILE):
-        raise FileNotFoundError(f"Missing '{DRIVE_TOKEN_FILE}' in cloud context.")
-    
-    creds = Credentials.from_authorized_user_file(DRIVE_TOKEN_FILE, scopes=['https://www.googleapis.com/auth/drive'])
-    return build('drive', 'v3', credentials=creds)
+def get_public_drive_service():
+    """Builds a public Drive reader using ONLY your API Key."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    return build('drive', 'v3', developerKey=api_key)
 
-def get_drive_files_dict(service, folder_id):
-    """Fetches a complete map of files inside a target folder handling page pagination."""
-    files_dict = {}
-    page_token = None
-    query = f"'{folder_id}' in parents and trashed = false"
-    
-    while True:
-        results = service.files().list(
-            q=query, 
-            fields="nextPageToken, files(id, name, size)",
-            pageSize=1000, 
-            pageToken=page_token
-        ).execute()
-        
-        for file in results.get('files', []):
-            # Parse size safely (Google API treats size as string; folders/shortcuts return nothing)
-            file_size = int(file.get('size', 0)) if 'size' in file else 0
-            files_dict[file['name']] = {'id': file['id'], 'size': file_size}
-            
-        page_token = results.get('nextPageToken')
-        if not page_token:
-            break
-            
-    return files_dict
+def get_mp3_duration(file_path):
+    """Reads the true duration of the MP3 file directly from disk like Windows File Manager."""
+    try:
+        audio = MP3(file_path)
+        mins = audio.info.length / 60
+        return f"{mins:.2f} minutes"
+    except Exception:
+        return "Unknown duration"
 
-# =============================================================================
-# MAIN AUTOMATION PIPELINE
-# =============================================================================
-def run_cloud_batch_transcription(input_folder_id, output_folder_id):
-    drive_service = get_drive_service()
-    
-    print("📡 Fetching file structures from Google Drive Input/Output Folders...")
-    input_drive_files = get_drive_files_dict(drive_service, input_folder_id)
-    output_drive_files = get_drive_files_dict(drive_service, output_folder_id)
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 
-    # Filter for supported tracks matching extensions matching meta payload schemas
-    tracks_to_process = {name: meta['id'] for name, meta in input_drive_files.items() if name.lower().endswith(SUPPORTED_FORMATS)}
+def main():
+    print("🎬 Starting Streamlined Public Pipeline...")
     
-    if not tracks_to_process:
-        print("ℹ️ No supported audio files found in the source Google Drive folder.")
+    os.makedirs(AUDIO_FOLDER, exist_ok=True)
+    os.makedirs(TRANSCRIPT_FOLDER, exist_ok=True)
+
+    # 1. SCAN PUBLIC FOLDER USING API KEY
+    print("\n📥 Scanning public Google Drive folder...")
+    try:
+        drive_service = get_public_drive_service()
+        items = []
+        page_token = None
+        while True:
+            results = drive_service.files().list(
+                q=f"'{FOLDER_ID}' in parents and trashed=false", 
+                fields="nextPageToken, files(id, name)",
+                pageToken=page_token,
+                pageSize=1000
+            ).execute()
+            items.extend(results.get('files', []))
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
+    except Exception as e:
+        print(f"❌ Public Drive Scan Failed: {e}. Check if folder link sharing is active.")
         return
 
-    print(f"🚀 Found {len(tracks_to_process)} target tracks. Initializing Gemini Client runtime...")
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=120000))
+    local_transcripts = os.listdir(TRANSCRIPT_FOLDER)
+    pending_audio = []
     
-    # Structural Alphabetical Sorting Fix (Case-Insensitive)
-    sorted_tracks = sorted(tracks_to_process.items(), key=lambda x: x[0].lower())
-    
-    for i, (filename, file_id) in enumerate(sorted_tracks, 1):
-        base_name, _ = os.path.splitext(filename)
-        transcript_name = f"{base_name}_transcript.txt"
-
-        # Check duplication constraint and file health directly in cloud output directory
-        if transcript_name in output_drive_files:
-            existing_transcript = output_drive_files[transcript_name]
-            
-            # 512 Bytes = 0.5 KB Guardrail
-            if existing_transcript['size'] >= 512:
-                print(f"⏩ [{i}/{len(tracks_to_process)}] Skipping '{filename}' (Transcript already exists on Drive).")
+    for item in items:
+        if item['name'].lower().endswith(SUPPORTED_FORMATS):
+            base_name, _ = os.path.splitext(item['name'])
+            if f"{base_name}_transcript.txt" in local_transcripts:
+                print(f"⏩ Skipping {item['name']} (Already transcribed matching text file)")
                 continue
-            else:
-                print(f"🗑️ [{i}/{len(tracks_to_process)}] Existing transcript '{transcript_name}' is corrupted/under 0.5 KB. Clearing file from Drive...")
-                try:
-                    drive_service.files().delete(fileId=existing_transcript['id']).execute()
-                except Exception as e:
-                    print(f"⚠️ Warning: Could not delete historical small file from Drive: {e}")
+            pending_audio.append(item) 
 
-        temp_local_audio = f"temp_{filename}"
-        
-        # Outer try-finally guarantees file cleanup on local runner disk, preventing runtime memory leaks
+    pending_audio.sort(key=lambda x: natural_sort_key(x['name']))
+
+    if not pending_audio:
+        print(f"ℹ️ No new audio files to process.")
+        return
+
+    print(f"🚀 Found {len(pending_audio)} pending tracks. Initializing Gemini...")
+    client = genai.Client() 
+    quota_exhausted = False
+
+    # 2. RUN TRANSCRIPTION BATCH
+    for i, item in enumerate(pending_audio, 1):
+        if quota_exhausted:
+            break
+
+        filename = item['name']
+        file_id = item['id']
+        file_path = os.path.join(AUDIO_FOLDER, filename)
+        base_name, _ = os.path.splitext(filename)
+        output_path = os.path.join(TRANSCRIPT_FOLDER, f"{base_name}_transcript.txt")
+
+        print(f"\n📥 [{i}/{len(pending_audio)}] Downloading via Public Stream: {filename}...")
         try:
-            success = False
-            audio_upload = None
-            file_start_time = time.time()
-            backoff_attempt = 0
+            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            response = requests.get(download_url, stream=True)
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        except Exception as e:
+            print(f"   ❌ Download failed: {e}")
+            continue
 
-            # Download targeted file stream into active runner disk space
-            print(f"⏳ [{i}/{len(tracks_to_process)}] Downloading '{filename}' from Drive to runner...")
-            request = drive_service.files().get_media(fileId=file_id)
-            with open(temp_local_audio, "wb") as f:
-                downloader = MediaIoBaseDownload(f, request)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
+        audio_duration = get_mp3_duration(file_path)
 
-            while not success:
-                try:
-                    if not audio_upload:
-                        print(f"   -> Uploading to Gemini Storage cloud engine...")
-                        upload_start = time.time()
-                        audio_upload = gemini_client.files.upload(file=temp_local_audio)
-                        print(f"   -> Upload complete in {time.time() - upload_start:.1f} seconds.")
+        success = False
+        audio_upload = None
+        file_start_time = time.time()
+        network_retries = 0
+        rate_limit_retries = 0
 
-                    file_info = gemini_client.files.get(name=audio_upload.name)
-                    while "processing" in str(file_info.state).lower():
-                        print("      [...] Backend processing metadata structures. Waiting 5 seconds...")
-                        time.sleep(5)
-                        file_info = gemini_client.files.get(name=audio_upload.name)
-
-                    if "failed" in str(file_info.state).lower():
-                        print("   ❌ Error: Google cloud pipeline extraction failed for this file.")
-                        break
-
-                    print(f"   -> Processing via {MODEL_ID} inference engines...")
-                    inference_start = time.time()
-
-                    response = gemini_client.models.generate_content(
-                        model=MODEL_ID,
-                        contents=[audio_upload, "Please transcribe this audio file verbatim."],
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            temperature=0.0
-                        )
-                    )
-
-                    print(f"   -> Server returned response in {time.time() - inference_start:.1f} seconds.")
+        while not success:
+            try:
+                if not audio_upload:
+                    print(f"⏳ Uploading 30MB file to Gemini File storage API...")
+                    audio_upload = client.files.upload(file=file_path)
                     
-                    # Streamlined Pythonic text validation extraction block
-                    transcript_body = response.text or "[Error: Empty stream packet returned from server.]"
+                file_info = client.files.get(name=audio_upload.name)
+                while "processing" in str(file_info.state).lower():
+                    time.sleep(5)
+                    file_info = client.files.get(name=audio_upload.name)
 
-                    # Calculate duration approximation from token data payload
-                    header_text = f"File name: {filename}\n"
-                    try:
-                        input_tokens = response.usage_metadata.prompt_token_count
-                        approx_minutes = (input_tokens / 32) / 60
-                        header_text += f"Audio file duration: {approx_minutes:.2f} minutes\n"
-                    except Exception:
-                        header_text += f"Audio file duration: Estimated via pipeline tokens\n"
+                if "failed" in str(file_info.state).lower():
+                    print("   ❌ Error: Google cloud audio processing failed.")
+                    break
 
-                    header_text += "----------------------------------------\n\n"
-                    full_payload = header_text + transcript_body
+                print(f"   -> Processing transcription via {MODEL_ID}...")
+                response = client.models.generate_content(
+                    model=MODEL_ID,
+                    contents=[audio_upload, "Please transcribe this audio file verbatim."],
+                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.0)
+                )
 
-                    # Inline Payload Size Guardrail Evaluation
-                    payload_bytes = full_payload.encode('utf-8')
-                    payload_size = len(payload_bytes)
+                transcript_body = response.text or "[Empty transcript returned]"
+                header_text = (
+                    f"File name: {filename}\n"
+                    f"Audio file duration: {audio_duration}\n"
+                    f"----------------------------------------\n\n"
+                )
 
-                    # 512 Bytes = 0.5 KB Check
-                    if payload_size < 512:
-                        print(f"⚠️ [{i}/{len(tracks_to_process)}] Generated transcript for '{filename}' is too small ({payload_size} bytes).")
-                        print(f"   -> Skipping upload entirely so the system can attempt a clean re-transcription tomorrow.")
-                        success = True 
-                        print("   ⏳ Sleeping 30 seconds to ease concurrent connections...")
-                        time.sleep(30)
-                        break # Safe exit from inner while loop to bypass insertion and push pipeline along
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(header_text + transcript_body)
+                print(f"   ✅ Saved Transcript: {base_name}_transcript.txt (⏱️ {(time.time() - file_start_time)/60:.2f}m)")
 
-                    # Stream file writing directly up to Google Drive via Memory Stream
-                    print(f"   ⏳ Uploading finalized transcript to Drive ({payload_size} bytes)...")
-                    text_stream = io.BytesIO(payload_bytes)
-                    cloud_file_metadata = {'name': transcript_name, 'parents': [output_folder_id]}
-                    media_payload = MediaIoBaseUpload(text_stream, mimetype='text/plain', resumable=True)
-                    
-                    drive_service.files().create(body=cloud_file_metadata, media_body=media_payload).execute()
+                if os.path.getsize(output_path) <= 1024:
+                    print(f"   ⚠️ Alert: File <= 1KB. Executing structural drop rule.")
+                    try: os.remove(output_path)
+                    except Exception: pass
+                    try: os.remove(file_path)
+                    except Exception: pass
+                    break
 
-                    total_file_time = time.time() - file_start_time
-                    print(f"   ✅ Saved to Drive: {transcript_name} (⏱️ Total time: {total_file_time/60:.2f}m)")
+                success = True
+                try: os.remove(file_path) 
+                except Exception: pass
+                time.sleep(3)
 
-                    success = True
-                    backoff_attempt = 0
-                    print("   ⏳ Sleeping 30 seconds to ease concurrent connections...")
-                    time.sleep(30)
+            except APIError as e:
+                rate_limit_retries += 1
+                if rate_limit_retries > MAX_RETRIES:
+                    print(f"\n❌ CRITICAL: Quota exhausted. Aborting queue processing run.")
+                    quota_exhausted = True  
+                    try: os.remove(file_path)
+                    except Exception: pass
+                    break 
+                
+                print(f"\n⚠️ Rate limit hit. Pausing for {60 * rate_limit_retries}s...")
+                time.sleep(60 * rate_limit_retries)
 
-                except APIError as e:
-                    error_str = str(e).lower()
-                    if any(x in error_str for x in ["429", "exhausted", "503", "unavailable", "504", "deadline"]):
-                        backoff_attempt += 1
-                        if backoff_attempt > MAX_RETRIES:
-                            print(f"\n❌ CRITICAL: Reached maximum retry limit ({MAX_RETRIES}). Resource quota exhausted.")
-                            return  
-                        sleep_cooldown = 30 * (2 ** backoff_attempt) # Improved to professional exponential backoff
-                        print(f"\n⚠️ Rate limit/server pressure. Pausing for {sleep_cooldown}s before retry...")
-                        if audio_upload:
-                            try: gemini_client.files.delete(name=audio_upload.name)
-                            except Exception: pass
-                            audio_upload = None
-                        time.sleep(sleep_cooldown)
-                    else:
-                        print(f"   ❌ Terminal API exception: {e}")
-                        break
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if any(x in error_str for x in ["timeout", "timed out", "read_timeout"]):
-                        backoff_attempt += 1
-                        if backoff_attempt > MAX_RETRIES:
-                            print(f"\n❌ CRITICAL: Reached maximum retry limit ({MAX_RETRIES}) due to persistent timeouts.")
-                            return
-                        sleep_cooldown = 30 * (2 ** backoff_attempt) # Exponential backoff
-                        print(f"\n⚠️ Connection timed out. Pausing for {sleep_cooldown}s before retry...")
-                        if audio_upload:
-                            try: gemini_client.files.delete(name=audio_upload.name)
-                            except Exception: pass
-                            audio_upload = None
-                        time.sleep(sleep_cooldown)
-                    else:
-                        print(f"   ❌ Unexpected local script failure: {e}")
-                        break
-                finally:
-                    if success and audio_upload:
-                        try: gemini_client.files.delete(name=audio_upload.name)
+            except Exception as e: 
+                error_msg = str(e).lower()
+                if any(x in error_msg for x in ["disconnected", "connection", "eof"]):
+                    network_retries += 1
+                    if network_retries > MAX_RETRIES:
+                        print(f"\n⚠️ Persistent connection drops. Skipping track.")
+                        try: os.remove(file_path)
                         except Exception: pass
-                        audio_upload = None
-                        
-        finally:
-            # Guarantees execution of local scratch space cleanup even during structural function returns
-            if os.path.exists(temp_local_audio):
-                os.remove(temp_local_audio)
+                        success = True  
+                        break            
+                    time.sleep(60 * network_retries)
+                else:
+                    print(f"   ❌ Unexpected Error: {e}")
+                    try: os.remove(file_path)
+                    except Exception: pass
+                    success = True 
+                    break
+            finally:
+                if success and audio_upload:
+                    try: client.files.delete(name=audio_upload.name)
+                    except Exception: pass
 
-    print("\n🎉 Batch script complete! All transcripts checked and sync'd with Google Drive.")
+    print("\n🏁 All operations completed successfully! Transcripts folder updated.")
 
-# =============================================================================
-# RUNTIME INVOCATION LANDING ZONE
-# =============================================================================
 if __name__ == "__main__":
-    # Target Input (MP3) and Output (TXT) Folder IDs
-    DRIVE_INPUT_FOLDER = "17MGWbLC8Qq_UxLCtOePc9aJgVSAakhde"
-    DRIVE_OUTPUT_FOLDER = "17MGWbLC8Qq_UxLCtOePc9aJgVSAakhde"
-
-    run_cloud_batch_transcription(
-        input_folder_id=DRIVE_INPUT_FOLDER,
-        output_folder_id=DRIVE_OUTPUT_FOLDER
-    )
+    main()
