@@ -2,10 +2,9 @@ name: Automated Audio Transcriber
 
 on:
   schedule:
-    - cron: '26 11 * * *' # Triggers automatically every single day at 3:30 PM IST (10:00 AM UTC)
-  workflow_dispatch: # Allows you to press the manual button to run it instantly
+    - cron: '26 11 * * *' 
+  workflow_dispatch: 
 
-# CRITICAL: Gives GitHub Actions permission to write the text files back to your repository
 permissions:
   contents: write
 
@@ -23,24 +22,19 @@ jobs:
 
     - name: Install System Dependencies
       run: |
-        pip install google-genai google-api-python-client mutagen python-dotenv requests
-
-    # REMOVED: The token.json extraction step is entirely gone since we are using public links!
+        pip install google-genai google-api-python-client google-auth mutagen python-dotenv requests
 
     - name: Execute Transcriber Pipeline
       env:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      run: python -u cloud_audio_transcriber.py  # <-- Make sure this matches your script's exact filename
+        GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+      run: python -u cloud_audio_transcriber.py
 
     - name: Commit and Push Transcripts back to GitHub
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        
-        # Stage only the transcripts folder
         git add transcripts/
-        
-        # Only commit if new text files were actually created, preventing errors if nothing changed
         if ! git diff-index --quiet HEAD; then
           git commit -m "🤖 Automated sync: Added new transcripts [skip ci]"
           git push
