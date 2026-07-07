@@ -14,6 +14,8 @@ jobs:
     steps:
     - name: Checkout Code Repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: true # <-- CRITICAL: Gives the runner authority to push code changes back
 
     - name: Set Up Python Environment
       uses: actions/setup-python@v5
@@ -34,10 +36,15 @@ jobs:
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        
+        # Explicitly stage your tracked folder 
         git add transcripts/
-        if ! git diff-index --quiet HEAD; then
+        
+        # Safe check using porcelain status to see if files actually changed
+        if [ -n "$(git status --porcelain transcripts/)" ]; then
           git commit -m "🤖 Automated sync: Added new transcripts [skip ci]"
-          git push
+          # <-- CRITICAL: Forces git to push directly to the running branch (e.g., main)
+          git push origin HEAD:${{ github.ref_name }}
         else
           echo "ℹ️ No new transcripts found to commit today."
         fi
