@@ -17,6 +17,7 @@ load_dotenv()
 # ==========================================
 # CONFIGURATION
 # ==========================================
+# Using standard flash architecture for reliable transcription loops
 MODEL_ID = 'gemini-3.5-flash' 
 MAX_RETRIES = 2  
 FOLDER_ID = '17MGWbLC8Qq_UxLCtOePc9aJgVSAakhde'         
@@ -59,25 +60,20 @@ def get_mp3_duration(file_path):
     except Exception:
         return "Unknown duration"
 
-def upload_to_google_drive(drive_service, local_file_path, drive_filename, parent_folder_id):
-    """Uploads the completed transcript text file directly back to your Google Drive folder instantly.
-       If it fails, catches the error, flashes a warning, and returns safely without crashing."""
+def update_google_drive_file(drive_service, file_id, local_file_path, drive_filename):
+    """Overwrites an existing user-owned placeholder file on Google Drive using its file ID.
+       This bypasses the 403 Service Account quota limitation completely."""
     try:
-        file_metadata = {
-            'name': drive_filename,
-            'parents': [parent_folder_id]
-        }
         media = MediaFileUpload(local_file_path, mimetype='text/plain')
-        uploaded_file = drive_service.files().create(
-            body=file_metadata,
+        updated_file = drive_service.files().update(
+            fileId=file_id,
             media_body=media,
             fields='id'
         ).execute()
-        print(f"   ☁️ Successfully uploaded to Google Drive! (File ID: {uploaded_file.get('id')})")
+        print(f"   ☁️ Successfully updated Google Drive placeholder! (File ID: {updated_file.get('id')})")
         return True
     except Exception as e:
-        print(f"   ⚠️ WARNING: Google Drive Upload Failed for '{drive_filename}': {e}")
-        print("   ⚠️ Script will continue processing remaining pipeline operations.")
+        print(f"   ⚠️ WARNING: Google Drive Overwrite Failed for '{drive_filename}': {e}")
         return False
 
 def natural_sort_key(s):
@@ -97,7 +93,7 @@ def main():
         while True:
             results = drive_service.files().list(
                 q=f"'{FOLDER_ID}' in parents and trashed=false", 
-                fields="nextPageToken, files(id, name)",
+                fields="nextPageToken, files(id, name, size)", # Added size to track placeholder states
                 pageToken=page_token,
                 pageSize=1000
             ).execute()
@@ -112,8 +108,8 @@ def main():
     # Gather local GitHub transcript files
     local_transcripts = set(os.listdir(TRANSCRIPT_FOLDER)) if os.path.exists(TRANSCRIPT_FOLDER) else set()
     
-    # Gather Google Drive inventory filenames
-    drive_filenames = {item['name'] for item in items}
+    # Map Drive files by name for faster lookup coordinates
+    drive_file_map = {item['name']: item for item in items}
     
     pending_audio = []
     
@@ -122,10 +118,18 @@ def main():
             base_name, _ = os.path.splitext(item['name'])
             transcript_name = f"{base_name}_transcript.txt"
             
-            # DUAL CHECK: Check if transcript exists locally ON GITHUB *OR* UPSTAIRS ON GOOGLE DRIVE
-            if transcript_name in local_transcripts or transcript_name in drive_filenames:
-                print(f"⏩ Skipping {item['name']} (Already transcribed in GitHub repository or Google Drive)")
+            # Check Local GitHub Index
+            if transcript_name in local_transcripts:
+                print(f"⏩ Skipping {item['name']} (Already transcribed in GitHub repository)")
                 continue
+            
+            # Check Google Drive Index: Only skip if file exists AND has content greater than 1KB
+            if transcript_name in drive_file_map:
+                drive_file = drive_file_map[transcript_name]
+                if 'size' in drive_file and int(drive_file['size']) > 1024:
+                    print(f"⏩ Skipping {item['name']} (Already transcribed in Google Drive)")
+                    continue
+                    
             pending_audio.append(item) 
 
     pending_audio.sort(key=lambda x: natural_sort_key(x['name']))
@@ -207,8 +211,12 @@ def main():
                     f.write(header_text + transcript_body)
                 print(f"   ✅ Saved Transcript Locally: {transcript_filename} (⏱️ {(time.time() - file_start_time)/60:.2f}m)")
 
-                # Step 2: Push back up to the Google Drive folder instantly (Safe from crashing)
-                upload_to_google_drive(drive_service, output_path, transcript_filename, FOLDER_ID)
+                # Step 2: Update the user-owned placeholder file on Google Drive using its unique file ID
+                if transcript_filename in drive_file_map:
+                    placeholder_id = drive_file_map[transcript_filename]['id']
+                    update_google_drive_file(drive_service, placeholder_id, output_path, transcript_filename)
+                else:
+                    print(f"   ⚠️ WARNING: No pre-created placeholder found on Drive for '{transcript_filename}'. Skipping Drive sync.")
 
                 # Run structural size safety checks
                 if os.path.getsize(output_path) <= 1024:
