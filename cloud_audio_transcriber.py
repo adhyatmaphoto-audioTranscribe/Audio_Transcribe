@@ -196,7 +196,7 @@ def main():
                 response = client.models.generate_content(
                     model=MODEL_ID,
                     contents=[audio_upload, "Please transcribe this audio file verbatim."],
-                    config=types.GenerateContentConfig(temperature=0.0)
+                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.0)
                 )
 
                 transcript_body = response.text or "[Empty transcript returned]"
