@@ -5,26 +5,33 @@ on:
     - cron: '26 11 * * *' 
   workflow_dispatch: 
 
-permissions:
-  contents: write
+# Concurrency handling stops double executions if queues stack up
+concurrency:
+  group: audio-transcriber
+  cancel-in-progress: false
 
 jobs:
   run-transcription:
     runs-on: ubuntu-latest
+    timeout-minutes: 360 # Protects your minutes allowance from infinite runtime freezes
+    permissions:
+      contents: write # Restricted strictly to job level scope for safety profiles
+
     steps:
     - name: Checkout Code Repository
       uses: actions/checkout@v4
       with:
-        persist-credentials: true # <-- CRITICAL: Gives the runner authority to push code changes back
+        persist-credentials: true
 
     - name: Set Up Python Environment
       uses: actions/setup-python@v5
       with:
         python-version: '3.13'
+        cache: 'pip' # Explicitly caches parsed environments to accelerate daily startup
 
     - name: Install System Dependencies
       run: |
-        pip install google-genai google-api-python-client google-auth mutagen python-dotenv requests
+        pip install -r requirements.txt
 
     - name: Execute Transcriber Pipeline
       env:
@@ -37,13 +44,11 @@ jobs:
         git config --global user.name "github-actions[bot]"
         git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
         
-        # Explicitly stage your tracked folder 
         git add transcripts/
         
-        # Safe check using porcelain status to see if files actually changed
-        if [ -n "$(git status --porcelain transcripts/)" ]; then
+        # Cleaner, explicit cached tracking optimization
+        if ! git diff --cached --quiet; then
           git commit -m "🤖 Automated sync: Added new transcripts [skip ci]"
-          # <-- CRITICAL: Forces git to push directly to the running branch (e.g., main)
           git push origin HEAD:${{ github.ref_name }}
         else
           echo "ℹ️ No new transcripts found to commit today."
