@@ -27,7 +27,7 @@ logging.basicConfig(
 # CONFIGURATION
 # ==========================================
 MODEL_ID = 'gemini-3.5-flash' 
-MAX_RETRIES = 3  
+MAX_RETRIES = 2 
 FOLDER_ID = '17MGWbLC8Qq_UxLCtOePc9aJgVSAakhde'         
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
