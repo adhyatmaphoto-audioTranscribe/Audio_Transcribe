@@ -10,9 +10,8 @@ from google.genai import types
 from google.genai.errors import APIError
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
-from googleapiclient.http import MediaFileUpload  
-import requests
-from mutagen.mp3 import MP3  
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+import mutagen  
 
 load_dotenv()
 
@@ -36,19 +35,14 @@ TRANSCRIPT_FOLDER = os.path.join(SCRIPT_DIR, 'transcripts')
 SUPPORTED_FORMATS = ('.mp3', '.wav', '.m4a', '.aac', '.flac')
 
 SYSTEM_PROMPT = (
-    "You are a precise, machine-level verbatim transcriptionist.\n"
-    "Transcribe the provided audio file exactly as spoken, word-for-word. "
-    "Do not summarize, condense, or edit. Output the literal transcript text only.\n\n"
-    "Strict Rules:\n"
-    "1. Multi-Lingual & Multi-Script Handling:\n"
-    "   - The primary audio is English spoken with an Indian (Odisha region) accent.\n"
-    "   - For Sanskrit and Hindi phrases: Transcribe them strictly in Devanagari script.\n"
-    "   - For Odia (Oriya) and Bengali phrases: If you are 100% certain of the language, transcribe them in their respective native scripts. Default to Devanagari if uncertain.\n"
-    "   - Do NOT translate any non-English phrases into English.\n"
-    "2. Poor Quality Audio: Write exactly the broken phonetic sound heard, or use [unclear].\n"
-    "3. No Autocorrect: Do not correct grammar or broken sentence structures.\n"
-    "4. Literalism: Transcribe stutters or repetitions exactly.\n"
-    "5. Formatting Constraints: Output ONLY the raw transcript text."
+    "आप एक शब्द-ब-शब्द (literal, word-for-word) ऑडियो ट्रांसक्राइबर हैं। एक पूरी तरह से निष्क्रिय श्रोता (passive listener) के रूप में कार्य करें जो केवल वही लिखता है जो सुना जाता है। पाठ (text) को \"ठीक\" या सुचारू करने के लिए किसी भी बाहरी ज्ञान, बुद्धिमत्ता या संदर्भ (context) का उपयोग न करें。\n\n"
+    "**सख्त नियम (Strict Rules):**\n\n"
+    "1. **लहजा और बोलियाँ (Accents & Dialects):** वक्ता (speaker) का लहजा भारतीय (Indian accent) है। बोले गए हिंदी शब्दों को बिल्कुल वैसे ही ट्रांसक्राइब करें जैसे वे उच्चारित किए जा रहे हैं।\n"
+    "2. **खराब गुणवत्ता वाला ऑडियो (Poor Quality Audio):** यदि कोई शब्द दबा हुआ (muffled), विकृत (distorted), या कटा हुआ है, तो अनुमान न लगाएं कि वक्ता क्या कहना चाहता था। जो टूटा-फूटा ध्वन्यात्मक शब्द (phonetic sound) सुनाई दे, उसे बिल्कुल वैसा ही लिखें, या यदि वह पूरी तरह से अस्पष्ट हो तो [unclear] का उपयोग करें।\n"
+    "3. **कोई ऑटो-करेक्ट नहीं (No Autocorrect):** व्याकरण (grammar) को न सुधारें, टूटी हुई वाक्य संरचनाओं को न बदलें, और स्लैंग (slang) या बोलचाल की भाषा को मानक हिंदी से न बदलें।\n"
+    "4. **अक्षरशः अनुवाद (Literalism):** यदि वक्ता किसी शब्द को दोहराता है, हकलाता है, या बोलने में कोई चूक करता है, तो उसे बिल्कुल वैसा ही ट्रांसक्राइब करें। इसे हटाएँ या संपादित (edit) न करें।\n"
+    "5. **कोई अतिरिक्त जानकारी नहीं (No Additions):** कोई परिचय, स्पष्टीकरण, सारांश या नोट्स न जोड़ें। आउटपुट में केवल और केवल ट्रांसक्राइब किया गया टेक्स्ट ही होना चाहिए。\n"
+    "Transcribe the attached audio file, which is in Hindi with some Sanskrit phrases."
 )
 
 def get_public_drive_service():
@@ -59,12 +53,16 @@ def get_public_drive_service():
     credentials = service_account.Credentials.from_service_account_info(sa_info)
     return build('drive', 'v3', credentials=credentials)
 
-def get_mp3_duration(file_path):
+def get_audio_duration(file_path):
+    """Auto-detects audio format (.mp3, .wav, .m4a, .flac, etc.) and returns formatted duration in minutes."""
     try:
-        audio = MP3(file_path)
-        mins = audio.info.length / 60
-        return f"{mins:.2f} minutes"
-    except Exception:
+        audio = mutagen.File(file_path)
+        if audio is not None and audio.info is not None:
+            mins = audio.info.length / 60
+            return f"{mins:.2f} minutes"
+        return "Unknown duration"
+    except Exception as e:
+        logging.warning(f"⚠️ Could not extract audio duration: {e}")
         return "Unknown duration"
 
 def update_google_drive_file(drive_service, file_id, local_file_path, drive_filename):
@@ -184,18 +182,17 @@ def main():
 
         logging.info(f"📥 [{i}/{len(pending_audio)}] Downloading: {filename}...")
         try:
-            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-            response = requests.get(download_url, stream=True, timeout=300)
-            response.raise_for_status()  # Check for download validity
-            with open(file_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+            request = drive_service.files().get_media(fileId=file_id)
+            with open(file_path, 'wb') as fh:
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
         except Exception as e:
-            logging.error(f"❌ Stream Download failed or timed out: {e}")
+            logging.error(f"❌ Drive API Download failed or timed out: {e}")
             continue
 
-        audio_duration = get_mp3_duration(file_path)
+        audio_duration = get_audio_duration(file_path)
         success = False
         audio_upload = None
         file_start_time = time.time()
